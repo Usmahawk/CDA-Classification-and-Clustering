@@ -1,0 +1,614 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+Libraries:
+```{r}
+library(dplyr)
+library(cdlTools)
+library(knitr)
+library(ROCR)
+library(ROCit)
+library(ggplot2)
+library(gridExtra)
+library(pander)
+```
+
+```{r}
+accident.raw = read.csv("us_data_2000.csv", header=T)
+```
+```{r}
+str(accident.raw)
+```
+Upon observing a quick summary of the data, we can see that the data is fairly inconsistent in the sense that there are some variables that have a fair bit of missing data. Apart from that, we can also see that there are IDs tagged to certain cases, for example, accident types, injury sources and nature of injuries.
+
+Additionally, there are some variables that may not be entirely relevant to EDA as well, so we might remove those columns.
+
+We are interested in the factors, or rather to create a model that predicts how serious an injury is, and the 2 columns that tell gives us the ground truth are "DEGREE_INJURY" and "DEGREE_INJURY_CD".
+
+Cleaning the data using dplyr select:
+```{r}
+accident = accident.raw %>% select(
+  c("MINE_ID", "CONTROLLER_NAME", "OPERATOR_NAME", "SUBUNIT", "CAL_YR", "CAL_QTR", "ACCIDENT_TIME","DEGREE_INJURY", "DEGREE_INJURY_CD", "FIPS_STATE_CD", "MINING_EQUIP", "EQUIP_MFR_NAME", "SHIFT_BEGIN_TIME", "CLASSIFICATION", "ACCIDENT_TYPE", "TOT_EXPER", "MINE_EXPER", "JOB_EXPER", "OCCUPATION", "ACTIVITY", "INJURY_SOURCE", "NATURE_INJURY", "INJ_BODY_PART", "DAYS_LOST", "COAL_METAL_IND", "NO_INJURIES"))
+remove(accident.raw)
+```
+The other variables look okay, but maybe we want to fix the state_id, just so we can see that variable easier and from which state it is from:
+```{r}
+accident$STATE_NAME = cdlTools::fips(accident$FIPS_STATE_CD, to ='Name')
+accident = subset(accident, select = -FIPS_STATE_CD)
+#str(accident)
+```
+
+Classification Problem: We want to predict the seriousness of the accident, so let's have a look at the variable:
+```{r}
+table(accident$DEGREE_INJURY, accident$DEGREE_INJURY_CD)
+```
+We remove the no value found first:
+```{r}
+accident = accident[!accident$DEGREE_INJURY_CD == '?',]
+```
+
+We classify seriousness of the accident by: 
+1: Fatality (1), Permanent total/partial disability (2)/Occupational Illness (7) 
+0: All other degrees
+
+Mask, Create new variable for degree of accident and drop the other variables:
+```{r}
+accident$DEG_ACCIDENT = (accident$DEGREE_INJURY_CD == 1 | accident$DEGREE_INJURY_CD == 2 |accident$DEGREE_INJURY_CD == 7)
+accident = subset(accident, select = -c(DEGREE_INJURY_CD, DEGREE_INJURY))
+accident$DEG_ACCIDENT = ifelse(accident$DEG_ACCIDENT == T, 1, 0)
+```
+
+Before we start any single variable modelling, we check the null model first, which ignores all of the input features and only looks at the proportion of the result. 
+
+```{r}
+Npos = sum(accident[,"DEG_ACCIDENT"] == 1 )
+pred.Null = Npos/nrow(accident)
+cat("Proportion of outcome == 1 in full data:", pred.Null)
+```
+So, any of our other SVM should do better then the null model.
+
+### Splitting the data into training and test set. 
+
+```{r}
+str(accident)
+```
+```{r}
+accident$DEG_ACCIDENT = factor(accident$DEG_ACCIDENT)
+```
+
+We split the training and test set (90,10)
+```{r}
+set.seed(4009)
+
+vars = setdiff(colnames(accident), c('DEG_ACCIDENT', 'group'))
+
+catVars = vars[sapply(accident[, vars], class) %in%
+c('character','integer')]
+numericVars = vars[sapply(accident[, vars], class) %in%
+c('numeric')]
+
+for (v in catVars) {
+  if (class(accident[,v]) == "integer") {
+    accident[,v] = as.character(accident[,v])
+  }
+}
+
+accident$group = runif(dim(accident)[1])
+trainingSet = subset(accident, group<= 0.9)
+testSet = subset(accident, group>0.9)
+```
+
+The relevant sets (80,20)
+```{r}
+calib.set = rbinom(dim(trainingSet)[1], size=1, prob=0.2)>0
+accidentCal = subset(trainingSet, calib.set)
+accidentTrain = subset(trainingSet, !calib.set)
+```
+
+Lets see one of the variables, which is the nature of the injury.
+```{r}
+outcome = 'DEG_ACCIDENT'
+pos = '1'
+```
+Amputation or Enucleation gives us a pure result, 
+```{r}
+table.NI = table(trainingSet[,'NATURE_INJURY'], trainingSet[,outcome], useNA='ifany')
+print(table.NI[,2]/(table.NI[,1]+table.NI[,2]))
+remove(table.NI)
+```
+Single Variable Models with Categorical 
+```{r}
+mkPredC = function(outCol, varCol, appCol) {
+  pPos <- sum(outCol == pos) / length(outCol)
+  naTab <- table(as.factor(outCol[is.na(varCol)]))
+  pPosWna <- (naTab/sum(naTab))[pos]
+  vTab <- table(as.factor(outCol), varCol)
+  pPosWv <- (vTab[pos, ] + pPos) / (colSums(vTab))
+  pred <- pPosWv[appCol]
+  pred[is.na(appCol)] <- pPosWna
+  pred[is.na(pred)] <- pPos
+  pred
+}
+```
+
+```{r}
+for(v in catVars) {
+pi <- paste('pred', v, sep='')
+accidentTrain[,pi] = mkPredC(accidentTrain[,outcome], accidentTrain[,v], accidentTrain[,v])
+accidentCal[,pi] = mkPredC(accidentTrain[,outcome], accidentTrain[,v], accidentCal[,v])
+testSet[,pi] = mkPredC(accidentTrain[,outcome], accidentTrain[,v], testSet[,v])
+}
+```
+
+Checking some of the results:
+```{r}
+rows <- c(52, 47, 122, 109, 132, 23)
+accidentCal[rows, c("ACTIVITY", "predACTIVITY")]
+```
+
+Classifier Evaluation ROCR:
+```{r}
+calcAUC <- function(predcol,outcol) {
+perf <- performance(prediction(predcol,outcol==pos),'auc')
+as.numeric(perf@y.values)
+}
+```
+
+```{r}
+for(v in catVars) {
+pi <- paste('pred', v, sep='')
+aucTrain <- calcAUC(accidentTrain[,pi], accidentTrain[,outcome])
+if (aucTrain >= 0.9) {
+aucCal <- calcAUC(accidentCal[,pi], accidentCal[,outcome])
+print(sprintf(
+"%s: trainAUC: %4.3f; calibrationAUC: %4.3f",
+pi, aucTrain, aucCal))
+}}
+```
+Bench marked on how well the training AUC performs. These are the best 6 variables that explain how well it predicts the data. 
+
+100 Fold CV: to check the accuracy of the AUC for the given variables.
+```{r}
+vars <- c('CLASSIFICATION', 'ACCIDENT_TYPE', 'ACTIVITY', 'INJURY_SOURCE', 'NATURE_INJURY','INJ_BODY_PART')
+
+for (var in vars) {
+  auc = rep(0, 100)
+  for (j in 1:length(auc)) {
+    useForCalRep = rbinom(n=nrow(trainingSet), size=1, prob=0.2) > 0
+    predRep = mkPredC(trainingSet[!useForCalRep,outcome],
+                      trainingSet[!useForCalRep,var],
+                      trainingSet[useForCalRep,var])
+    auc[j] = calcAUC(predRep, trainingSet[useForCalRep,outcome])
+  }
+print(sprintf("%s: mean: %4.3f; sd: %4.3f", var, mean(auc), sd(auc)))
+}
+```
+
+Double Density plots: Need to Adjust
+```{r}
+dd1= ggplot(data=accidentCal) + geom_density(aes(x=predCLASSIFICATION, color=factor(DEG_ACCIDENT)))
+dd2= ggplot(data=accidentCal) + geom_density(aes(x=predACTIVITY, color=factor(DEG_ACCIDENT)))
+dd3= ggplot(data=accidentCal) + geom_density(aes(x=predACCIDENT_TYPE, color=factor(DEG_ACCIDENT)))
+dd4 = ggplot(data=accidentCal) + geom_density(aes(x=predINJURY_SOURCE, color=factor(DEG_ACCIDENT)))
+dd5 = ggplot(data=accidentCal) + geom_density(aes(x=predNATURE_INJURY, color=factor(DEG_ACCIDENT)))
+dd6 = ggplot(data=accidentCal) + geom_density(aes(x=predINJ_BODY_PART, color=factor(DEG_ACCIDENT)))
+```
+
+Single Variable Models with Numericals
+Over here we are measuring the spread just like the way we do in boxplots and then converting the numerics to categorical levels
+```{r}
+numericVars
+q01 <- quantile(trainingSet[,"TOT_EXPER"], probs=seq(0, 1, 0.1), na.rm=T) # remove NA 
+dis.VarTOT = cut(trainingSet[,"TOT_EXPER"], unique(q01))
+q02 <- quantile(trainingSet[,"MINE_EXPER"], probs=seq(0, 1, 0.1), na.rm=T) # remove NA 
+dis.VarMINE = cut(trainingSet[,"MINE_EXPER"], unique(q02))
+q03 <- quantile(trainingSet[,"JOB_EXPER"], probs=seq(0, 1, 0.1), na.rm=T) # remove NA 
+dis.VarJOB = cut(trainingSet[,"JOB_EXPER"], unique(q03))
+```
+
+Now we build the function using the modification on the older model that we used during dealing with the categorical variables
+```{r}
+mkPredN = function(outCol, varCol, appCol) {
+# compute the cuts
+cuts <- unique(
+quantile(varCol, probs=seq(0, 1, 0.1), na.rm=T)) # discretize the numerical columns
+varC <- cut(varCol,cuts) 
+appC <- cut(appCol,cuts) 
+mkPredC(outCol,varC,appC) 
+}
+```
+```{r}
+for(v in numericVars) {
+pi <- paste('pred', v, sep='')
+accidentTrain[,pi] <- mkPredN(accidentTrain[,outcome], accidentTrain[,v], accidentTrain[,v]) 
+accidentCal[,pi] <- mkPredN(accidentTrain[,outcome], accidentTrain[,v], accidentCal[,v]) 
+testSet[,pi] <- mkPredN(accidentTrain[,outcome], accidentTrain[,v], testSet[,v]) 
+aucTrain <- calcAUC(accidentTrain[,pi], accidentTrain[,outcome])
+if(aucTrain >= 0.55) {
+aucCal <- calcAUC(accidentCal[,pi], accidentCal[,outcome])
+print(sprintf(
+"%s: trainAUC: %4.3f; calibrationAUC: %4.3f",
+pi, aucTrain, aucCal))
+}
+}
+```
+Double Density plots:
+```{r}
+ddm1 = ggplot(data=accidentCal) + geom_density(aes(x=predTOT_EXPER, color=factor(DEG_ACCIDENT)))
+ddm2 = ggplot(data=accidentCal) + geom_density(aes(x=predMINE_EXPER, color=factor(DEG_ACCIDENT)))
+ddm3 = ggplot(data=accidentCal) + geom_density(aes(x=predJOB_EXPER, color=factor(DEG_ACCIDENT)))
+```
+
+ROC Curves:
+ROC Function:
+```{r}
+plot_roc <- function(predcol, outcol, colour_id=2, overlaid=F) {
+ROCit_obj <- rocit(score=predcol, class=outcol==pos)
+par(new=overlaid)
+plot(ROCit_obj, col = c(colour_id, 1),
+legend = FALSE, YIndex = FALSE, values = FALSE)
+}
+```
+
+```{r}
+plot_roc(accidentCal$predNATURE_INJURY, accidentCal[,"DEG_ACCIDENT"])
+plot_roc(accidentCal$predCLASSIFICATION, accidentCal[,"DEG_ACCIDENT"], colour_id = 3, overlaid = T)
+plot_roc(accidentCal$predINJ_BODY_PART, accidentCal[,"DEG_ACCIDENT"], colour_id = 6, overlaid = T)
+plot_roc(accidentCal$predINJURY_SOURCE, accidentCal[,"DEG_ACCIDENT"], colour_id = 4, overlaid = T)
+plot_roc(accidentCal$predACCIDENT_TYPE, accidentCal[,"DEG_ACCIDENT"], colour_id = 5, overlaid = T)
+```
+ROC Curves for NUmerical:
+```{r}
+plot_roc(accidentCal$predJOB_EXPER, accidentCal[,"DEG_ACCIDENT"])
+plot_roc(accidentCal$predMINE_EXPER, accidentCal[,"DEG_ACCIDENT"], colour_id = 3, overlaid = T)
+plot_roc(accidentCal$predTOT_EXPER, accidentCal[,"DEG_ACCIDENT"], colour_id = 4, overlaid = T)
+```
+
+Feature Selection using log Likelihood:
+```{r}
+logLikelihood <- function(ytrue, ypred, epsilon=1e-6, pos=1) {
+  sum(ifelse(ytrue==pos, log(ypred+epsilon), log(1-ypred+epsilon)), na.rm=T)
+}
+```
+
+Calculating the likelihood of the null model on the calibration set and then pick variables based on the reduction of deviance w.r.t to Null deviance
+```{r}
+outcome = 'DEG_ACCIDENT'
+
+logNull = logLikelihood( accidentCal[,outcome],sum(accidentCal[,outcome]==pos)/nrow(accidentCal) )
+logNull
+```
+```{r}
+selectCatVars = c()
+selVars = c()
+minDrop = 30
+
+for (v in catVars) {
+  pi = paste('pred', v, sep='')
+  devDrop = 2*(logLikelihood(accidentCal[,outcome], accidentCal[,pi])- logNull) 
+  if (devDrop >= minDrop) { 
+    print(sprintf("%s, deviance reduction: %g", pi, devDrop)) 
+    selectCatVars = c(selectCatVars, pi)
+    selVars = c(selVars, v)
+  }
+}
+```
+###by Daniel Tan
+Based on the result here we observe that the predictor NATURE_INJURY on the calibration set gives us the largest reduction to deviance. We compare this to the AUC calculated above, which confirms our understanding that the nature of injuries contributes largest to the degree of injury.
+
+Numerical variables, picking the variables based on their reduction with respect to the null deviance 
+
+```{r}
+selectNumVars = c()
+minDrop = 5
+
+for (v in numericVars) {
+  pi = paste('pred', v, sep='')
+  devDrop = 2*(logLikelihood(accidentCal[,outcome], accidentCal[,pi])- logNull) 
+  if (devDrop >= minDrop) { 
+    print(sprintf("%s, deviance reduction: %g", pi, devDrop)) 
+    selectNumVars = c(selectNumVars, pi)}
+}
+```
+Looking at the numerical variables, we can see that the deviance reduction is negative for all numerical variables, meaning that the for these variables, they perform worse than the null model. Hence, we do not pick any of the numerical variables.
+
+Therefore, we choose the 6 variables below to build our model:
+```{r}
+selectVars = c(selectCatVars, selectNumVars)
+selectVars
+```
+### Model Building 
+Logistic Regression:
+
+Since we already seperated the test and training sets:
+```{r}
+cat("Training set size is", dim(accidentTrain), '\n')
+cat("Test set size is", dim(testSet))
+```
+Logistic Regression Model:
+
+We use the reprocessed variables, which hides the categorical levels with numeric predictions. In this case for our dataset, this makes sense because the variables that we are using have a large amount of variables, and if we split the dataset into a training, calibration and test one, then we might run into the problem of the one or more of the variables not in either set, which will cause a problem in the model running. 
+
+Logistic Regression Model on the 6 variables
+```{r}
+model.log = caret::train(x=accidentTrain[selectVars], y=accidentTrain[,'DEG_ACCIDENT'], method='glm', family=binomial(link='logit'), metric="Accuracy")
+```
+
+```{r}
+model.log
+```
+ML Evaluation Metrics on Accuracy and Kappa:
+
+- The accuracy of the training set is 98.7%, which tells us the percentage of correctly classified instances out of all observations
+
+Using the model on the calibration and test data:
+
+Calculating the AUC on the 3 sets, training, calibration and test set. 
+```{r}
+# Training Set
+calcAUC(as.numeric(as.character(predict(model.log, newdata = accidentTrain))),accidentTrain[,outcome])
+
+# Calibration Set
+calcAUC(as.numeric(as.character(predict(model.log, newdata = accidentCal))), accidentCal[,outcome])
+
+# Test Set
+calcAUC(as.numeric(as.character(predict(model.log, newdata = testSet))),testSet[,outcome])
+```
+Performance Measures: Accuracy, Precision, Recall and F1 Score 
+
+The log likelihood function:
+```{r}
+logLikelihood2 <- function(ytrue, ypred, epsilon=1e-6, pos=1) {
+  sum(ifelse(ytrue==pos, log(ypred+epsilon), log(1-ypred+epsilon)), na.rm=T)
+}
+```
+
+Testing whether my function works 
+```{r}
+ypred.calibration = as.numeric(as.character(predict(model.log, newdata = accidentCal)))
+ytrue.calibration = accidentCal[,outcome]
+```
+
+Performance Measures Function:
+```{r}
+performanceMeasures = function(ytrue, ypred, model.name = "model", threshold = 0.5)  {
+  # normalised deviance
+  dev.norm = -2 * logLikelihood(ytrue, ypred)/length(ypred)
+  #confusion matrix:
+  confMat = table(ytrue, ypred >= threshold)
+  accuracy = sum(diag(confMat)) / sum(confMat)
+  precision = confMat[2, 2] / sum(confMat[, 2])
+  recall = confMat[2, 2] / sum(confMat[2, ])
+  f1 = 2 * precision * recall / (precision + recall)
+  data.frame(model = model.name, accuracy = accuracy, precision = precision, recall = recall, f1 = f1, dev.norm = dev.norm)
+}
+```
+
+Helper Functions for Pander Table: 
+```{r}
+panderOpt = function(){ 
+panderOptions("plain.ascii",TRUE)
+panderOptions("keep.trailing.zeros",TRUE)
+panderOptions("table.style","simple")
+}
+```
+
+```{r}
+pp_table = function(model, xtrain, ytrain, xtest, ytest, xcal, ycal, mainLabel, threshold =0.5){
+  panderOpt()
+  perf_justify = 'lrrrrr'
+  
+  pred_train = as.numeric(as.character(predict(model, newdata = accidentTrain)))
+  pred_test = as.numeric(as.character(predict(model, newdata = testSet)))
+  pred_cal =  as.numeric(as.character(predict(model, newdata = accidentCal)))
+  
+  train_df = performanceMeasures(ytrain,pred_train, model.name = 'training')
+  cal_df = performanceMeasures(ycal,pred_cal, model.name = 'calibration')
+  test_df = performanceMeasures(ytest,pred_test, model.name = 'test')
+  
+  perftable <- rbind(train_df, cal_df, test_df)
+  pandoc.table(perftable,caption = mainLabel, justify = perf_justify)
+}
+```
+
+```{r}
+pp_table(model.log, accidentTrain[selectCatVars],accidentTrain[,outcome]==pos,
+testSet[selectCatVars],testSet[,outcome]==pos, 
+accidentCal[selectCatVars],accidentCal[,outcome]==pos,"Logistic Regression" )
+```
+
+Plotting the AUC 
+```{r}
+plot_ROC = function(predcoltrain, outcoltrain, predcolcal, outcolcal, predcoltest, outcoltest) {
+  roc_train = rocit(score=predcoltrain, class=outcoltrain==pos)
+  roc_cal = rocit(score=predcolcal, class=outcolcal==pos)
+  roc_test = rocit(score=predcoltest, class=outcoltest==pos)
+  
+  plot(roc_train, col=c('blue','green'), lwd=3,legend=FALSE,YIndex=FALSE,values=TRUE,asp=1)
+  lines(roc_cal$TPR ~ roc_cal$FPR, lwd=3, col=c('red','green'), asp=1)
+  lines(roc_test$TPR ~ roc_test$FPR, lwd=3, col=c('orange','green'), asp=1)
+  legend("bottomright",col=c("blue",'red','orange'), c("Training","Calibration","Test"),lwd=2)
+}
+
+pred_train = as.numeric(as.character(predict(model.log, newdata = accidentTrain)))
+pred_test = as.numeric(as.character(predict(model.log, newdata = testSet)))
+pred_cal =  as.numeric(as.character(predict(model.log, newdata = accidentCal)))
+
+plot_ROC(
+  pred_train, accidentTrain[[outcome]], pred_cal, accidentCal[[outcome]], pred_test, testSet[[outcome]])
+```
+
+###by Daniel Tan
+
+
+
+
+###by Momen
+We firstly use the Naive Bayes model 
+Naive-Bayes Model:
+```{r}
+
+model.nb = caret::train(x=accidentTrain[selectCatVars], y=accidentTrain[,'DEG_ACCIDENT'], method='nb', metric="Accuracy");
+model.nb
+```
+
+```{r}
+# Training Set
+calcAUC(as.numeric(as.character(predict(model.nb, newdata = accidentTrain))),accidentTrain[,outcome])
+
+# Calibration Set
+calcAUC(as.numeric(as.character(predict(model.nb, newdata = accidentCal))), accidentCal[,outcome])
+
+# Test Set
+calcAUC(as.numeric(as.character(predict(model.nb, newdata = testSet))),testSet[,outcome])
+```
+The values of AUC on Training set and the Calibration set turns out to be good since there are almost close to 1
+
+Performance Measures: Accuracy, Precision, Recall and F1 Score 
+
+The log likelihood function:
+```{r}
+logLikelihood2 <- function(ytrue, ypred, epsilon=1e-6, pos=1) {
+  sum(ifelse(ytrue==pos, log(ypred+epsilon), log(1-ypred+epsilon)), na.rm=T)
+}
+```
+
+Testing whether my function works 
+```{r}
+ypred.calibration = as.numeric(as.character(predict(model.nb, newdata = accidentCal)))
+ytrue.calibration = accidentCal[,outcome]
+```
+
+Performance Measures Function:
+```{r}
+performanceMeasures = function(ytrue, ypred, model.name = "model", threshold = 0.5)  {
+  # normalised deviance
+  dev.norm = -2 * logLikelihood(ytrue, ypred)/length(ypred)
+  #confusion matrix:
+  confMat = table(ytrue, ypred >= threshold)
+  accuracy = sum(diag(confMat)) / sum(confMat)
+  precision = confMat[2, 2] / sum(confMat[, 2])
+  recall = confMat[2, 2] / sum(confMat[2, ])
+  f1 = 2 * precision * recall / (precision + recall)
+  data.frame(model = model.name, precision = precision, recall = recall, f1 = f1, dev.norm = dev.norm)
+}
+```
+```{r}
+performanceMeasures(ytrue.calibration,ypred.calibration)
+```
+Helper Functions for Pander Table: 
+```{r}
+panderOpt = function(){ 
+panderOptions("plain.ascii",TRUE)
+panderOptions("keep.trailing.zeros",TRUE)
+panderOptions("table.style","simple")
+}
+```
+A function to pretty print the performance table of a model on the training and test sets
+```{r}
+pp_table = function(model, xtrain, ytrain, xtest, ytest, xcal, ycal, mainLabel, threshold =0.5){
+  panderOpt()
+  perf_justify = 'lrrrr'
+  
+  pred_train = as.numeric(as.character(predict(model, newdata = accidentTrain)))
+  pred_test = as.numeric(as.character(predict(model, newdata = testSet)))
+  pred_cal =  as.numeric(as.character(predict(model, newdata = accidentCal)))
+  
+  train_df = performanceMeasures(ytrain,pred_train, model.name = 'training')
+  cal_df = performanceMeasures(ycal,pred_cal, model.name = 'calibration')
+  test_df = performanceMeasures(ytest,pred_test, model.name = 'test')
+  
+  perftable <- rbind(train_df, cal_df, test_df)
+  pandoc.table(perftable,caption = mainLabel, justify = perf_justify)
+}
+```
+```{r}
+pp_table(model.nb, accidentTrain[selectCatVars],accidentTrain[,outcome]==pos,
+testSet[selectCatVars],testSet[,outcome]==pos, 
+accidentCal[selectCatVars],accidentCal[,outcome]==pos,"Naive Bayes", )
+```
+```{r}
+ypred.calibration = as.numeric(as.character(predict(model.nb, newdata = accidentCal)))
+ytrue.calibration = accidentCal[,outcome]
+```
+```{r}
+rocit(score=ypred.calibration, class=ytrue.calibration==pos)
+```
+Plotting the AUC 
+```{r}
+plot_ROC = function(predcoltrain, outcoltrain, predcolcal, outcolcal, predcoltest, outcoltest) {
+  roc_train = rocit(score=predcoltrain, class=outcoltrain==pos)
+  roc_cal = rocit(score=predcolcal, class=ytrue.calibration==pos)
+  roc_test = rocit(score=predcoltest, class=outcoltest==pos)
+  
+  plot(roc_train,col= c("blue","green"), lwd = 3,
+       legend=FALSE,YIndex=FALSE,value=TRUE,asp=1)
+  
+  lines(roc_cal$TPR ~ roc_cal$FPR,lwd=3,col=c("red","green"), asp=1)
+  lines(roc_test$TPR ~ roc_test$FPR,lwd=3,col=c("orange","green"), asp=1)
+  legend("bottomright",col=c("blue","red","orange"), c("Training",
+                                                      "Calibration",
+                                                      "Test"), lwd=2)
+}
+pred_train = as.numeric(as.character(predict(model.nb, newdata = accidentTrain)))
+pred_test = as.numeric(as.character(predict(model.nb, newdata = testSet)))
+pred_cal = as.numeric(as.character(predict(model.nb, newdata = accidentCal)))
+
+plot_ROC(pred_train, accidentTrain[[outcome]], pred_cal, accidentCal[[outcome]],
+         pred_test, testSet[[outcome]])
+```
+###by Momen
+
+###by Momen 2
+```{r}
+library(formattable)
+
+pp_table(model.log, accidentTrain[selectCatVars],accidentTrain[,outcome]==pos,
+testSet[selectCatVars],testSet[,outcome]==pos, 
+accidentCal[selectCatVars],accidentCal[,outcome]==pos,"Logistic Regression" )
+
+
+pp_table(model.nb, accidentTrain[selectCatVars],accidentTrain[,outcome]==pos,
+testSet[selectCatVars],testSet[,outcome]==pos, 
+accidentCal[selectCatVars],accidentCal[,outcome]==pos,"Naive Bayes" )
+
+
+```
+###by Momen 2
+Comparison and Contrast of the two models:
+The performance table of the Logistic Regression Model turns out to be far better than when we run the Naive-Bayes Model. The AUC of the Test Data for both the model shows that Logistic Regression has an upperhand of 0.70 whereas the AUC for the Test data of the Naive Bayes model turns out to be 0.67. Incase of the normalised deviance of the Training sets of Logistic Regression is smaller than that of the Naive Bayes which tells us that Logistic Regression is better. Furthermore if we take a look at the normalised deviance of the  Calibration sets we get to see that Logistic Regression performs better since the value is smaller. On the other hand Precision of the Logistic Regression of the Training Set is more than Naive Bayes which indicates that Logistic Regression performs well. Same goes for the Calibration sets which tells us that the precision of Logistic Regression is more than the precision of the Calibration sets of the Naive Bayes. Furthermore the Recall part of the Training set of the Logistic Regression and the Recall part of Training set of Naive Bayes are the same. But the Naive Bayes performs well for the Recall of the Calibration set compared to the Logistic Regression. Overall the Performance measures shows that Logistic Regression performs better.
+
+
+
+```{r}
+par(mfrow = c(1, 2))
+plot_ROC(as.numeric(as.character(predict(model.log, newdata = accidentTrain))), accidentTrain[[outcome]], as.numeric(as.character(predict(model.log, newdata = accidentCal))), accidentCal[[outcome]], as.numeric(as.character(predict(model.log, newdata = testSet))), testSet[[outcome]])
+title(main = "Logistic Regression")
+plot_ROC(as.numeric(as.character(predict(model.nb, newdata = accidentTrain))), accidentTrain[[outcome]], as.numeric(as.character(predict(model.nb, newdata = accidentCal))), accidentCal[[outcome]],
+as.numeric(as.character(predict(model.nb, newdata = testSet))), testSet[[outcome]])
+title(main = "Naive-Bayes")
+```
+According to the AUC curves of both the models we get to see that in our case the Logistic Regression model works better than the Naive-Bayes Model. 
+
+two LIMEs for two models
+```{r}
+library(lime)
+###Logistic Regression
+explainer <- lime(accidentTrain[selectVars], model = model.log, 
+                  bin_continuous = TRUE, n_bins = 10)
+
+cases <- c(111,23,94,179)
+example <- testSet[cases,selectVars]
+##     Sepal.Length Sepal.Width Petal.Length Petal.Width
+## 4            4.6         3.1          1.5         0.2
+## 43           4.4         3.2          1.3         0.2
+## 77           6.8         2.8          4.8         1.4
+## 113          6.8         3.0          5.5         2.1
+explanation <- lime::explain(example, explainer, n_labels = 1, n_features = 4)
+plot_features(explanation)
+##two of them should be one
+```
+
+
+testSet$DEG_ACCIDENT we take two zeros and two ones and we run LIME from the lab sheet
